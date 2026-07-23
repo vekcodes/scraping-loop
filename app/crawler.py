@@ -20,6 +20,7 @@ from .jina_client import (
     extract_candidate_links,
     extract_detail_keys,
     extract_pagination_links,
+    extract_stated_total,
     fetch_via_jina,
     normalize_url,
     strip_links_summary,
@@ -98,6 +99,7 @@ async def check_properties(url: str) -> CheckResponse:
     visited: set = set()
     queue: List[str] = [start]
     listing_pages: List[ListingPage] = []
+    stated_totals_seen: List[int] = []   # numbers the site prints ("442 properties")
     had_fetch_failure = False
     classify_failures = 0
     classify_successes = 0
@@ -135,6 +137,13 @@ async def check_properties(url: str) -> CheckResponse:
                 classification = res.classification
                 full = res.content or ""            # includes Jina link summary
                 main = strip_links_summary(full)     # page body only
+
+                # A printed total ("442 properties") can appear on any page —
+                # it's the most reliable count when the full card list isn't
+                # in the scraped HTML (JS/lazy-load/pagination).
+                stated = extract_stated_total(main)
+                if stated is not None:
+                    stated_totals_seen.append(stated)
 
                 if classification.type == "individual_listings":
                     listing_pages.append(
@@ -177,17 +186,35 @@ async def check_properties(url: str) -> CheckResponse:
             "Every page classification failed — check OPENAI_API_KEY and quota."
         )
 
-    return _build_response(listing_pages, visited, had_fetch_failure)
+    return _build_response(
+        listing_pages, visited, had_fetch_failure, stated_totals_seen
+    )
 
 
 def _build_response(
     listing_pages: List[ListingPage],
     visited: set,
     had_fetch_failure: bool,
+    stated_totals_seen: List[int],
 ) -> CheckResponse:
     pages_checked = sorted(visited)
 
+    # Largest total the site printed anywhere ("442 properties"). Reliable when
+    # the full card list isn't in the scraped HTML.
+    max_printed = max(stated_totals_seen) if stated_totals_seen else None
+
     if not listing_pages:
+        # No countable listings page reached, but the site may still print its
+        # total on the homepage/category page — use that.
+        if max_printed is not None:
+            return CheckResponse(
+                has_10_plus_properties=max_printed >= 10,
+                property_count=max_printed,
+                count_type="confirmed",
+                source=f"site-stated total ({max_printed})",
+                pages_checked=pages_checked,
+                breakdown=[],
+            )
         return CheckResponse(
             has_10_plus_properties=False,
             property_count=None,
@@ -229,26 +256,26 @@ def _build_response(
     )
     heading_total = sum(p.heading_count for p in unique)
 
-    max_stated = max(stated_totals) if stated_totals else None
     max_pagination = max(pagination_totals) if pagination_totals else None
+
+    # A single "stated" signal combining the deterministic regex (any page) and
+    # the LLM's stated_total reads. This is the site's own printed count.
+    stated_candidates = list(stated_totals_seen) + list(stated_totals)
+    stated_all = max(stated_candidates) if stated_candidates else None
 
     # ── Reconcile into one total + basis ────────────────────────────────────
     # The deterministic detail-key union is primary: across categories it sums
-    # distinct properties, across pagination it dedupes overlap. LLM stated /
-    # pagination totals refine it (a site may advertise more than we scraped).
+    # distinct properties, across pagination it dedupes overlap. But when the
+    # site PRINTS a larger total than we could find links for (JS/lazy-load/
+    # pagination only ships a partial grid), trust that printed number.
     if det_total > 0:
         total, basis = det_total, "counted_items"
-        if max_pagination is not None and max_pagination > det_total:
+        if max_pagination is not None and max_pagination > total:
             total, basis = max_pagination, "pagination"
-        # A single listings page that explicitly claims MORE than we could find
-        # links for is lazy-loading the rest — trust the stated total.
-        if len(unique) == 1 and max_stated is not None and max_stated > total:
-            total, basis = max_stated, "stated_total"
-    elif stated_totals:
-        # No parseable detail links. Sum per-category stated totals; a single
-        # page's stated total stands alone.
-        total = sum(stated_totals) if len(stated_totals) > 1 else stated_totals[0]
-        basis = "stated_total"
+        if stated_all is not None and stated_all > total:
+            total, basis = stated_all, "stated_total"
+    elif stated_all is not None:
+        total, basis = stated_all, "stated_total"
     elif max_pagination is not None:
         total, basis = max_pagination, "pagination"
     elif llm_counted_sum > 0:

@@ -4,6 +4,7 @@ r.jina.ai renders JS-heavy pages on Jina's own infrastructure and returns
 clean markdown, so this service only ever makes plain HTTP calls.
 """
 
+import asyncio
 import os
 import re
 from typing import List, Optional, Set
@@ -12,6 +13,12 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 import httpx
 
 JINA_BASE = "https://r.jina.ai/"
+
+# Retry rate-limited / transient fetches. Unauthenticated r.jina.ai allows only
+# ~20 req/min, so a batch run hits 429s; back off and retry rather than dropping
+# the page (a dropped fetch silently undercounts).
+_MAX_RETRIES = 3
+_BACKOFF_BASE_SECONDS = 2.0
 
 
 def _jina_timeout() -> float:
@@ -61,19 +68,30 @@ async def fetch_via_jina(client: httpx.AsyncClient, target_url: str) -> Optional
         return None
 
     jina_url = JINA_BASE + target_url
-    try:
-        resp = await client.get(
-            jina_url,
-            headers=_headers(),
-            timeout=_jina_timeout(),
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-    except (httpx.HTTPError, httpx.TimeoutException):
-        return None
-
-    content = resp.text.strip()
-    return content or None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = await client.get(
+                jina_url,
+                headers=_headers(),
+                timeout=_jina_timeout(),
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            content = resp.text.strip()
+            return content or None
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            # Retry only on rate-limit / transient server errors.
+            if status in (429, 502, 503, 504) and attempt < _MAX_RETRIES - 1:
+                await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                continue
+            return None
+        except (httpx.TimeoutException, httpx.TransportError):
+            if attempt < _MAX_RETRIES - 1:
+                await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                continue
+            return None
+    return None
 
 
 def normalize_url(url: str) -> str:
@@ -102,6 +120,20 @@ def same_site(url_a: str, url_b: str) -> bool:
     return registered_domain(urlparse(url_a).netloc) == registered_domain(
         urlparse(url_b).netloc
     )
+
+
+# Property inventory often lives on a dedicated booking subdomain that is a
+# DIFFERENT registered domain (e.g. site "heartwoodfh.com" links its listings on
+# "book.heartwoodfurnishedhomes.com"). Follow these cross-domain, since they host
+# the same company's properties.
+_BOOKING_HOST_RE = re.compile(
+    r"(?i)^(book|rentals?|reserve|reservations?|booking|portal|stay|guest|search|"
+    r"availability|vacation|properties|listings?)\."
+)
+
+
+def is_booking_host(url: str) -> bool:
+    return bool(_BOOKING_HOST_RE.match(urlparse(url).netloc))
 
 
 # Keywords that flag a link as a likely listings/portfolio page. Matched against
@@ -164,7 +196,8 @@ def extract_candidate_links(base_url: str, content: str) -> List[str]:
         haystack = (raw_link + " " + anchor_by_url.get(raw_link, "")).lower()
         if not any(kw in haystack for kw in CANDIDATE_KEYWORDS):
             continue
-        if not same_site(base_url, link):
+        # Same site, or a booking portal on another domain (follow those too).
+        if not same_site(base_url, link) and not is_booking_host(link):
             continue
         # Skip obvious asset/image links.
         if re.search(r"\.(png|jpe?g|svg|gif|webp|pdf|css|js)(\?|$)", link, re.I):
@@ -281,6 +314,67 @@ def count_headings(content: str) -> int:
     if not content:
         return 0
     return len({h.strip() for h in _HEADING_RE.findall(content)})
+
+
+# ── Stated-total extraction ──────────────────────────────────────────────────
+# Big/JS sites rarely ship every property card in the HTML, but they usually
+# PRINT the total ("442 properties", "Showing 1–20 of 442", "84 results").
+# That printed number is the most reliable count when the full card list isn't
+# scrapable, so we extract it deterministically.
+
+# Listing nouns a real total is attached to. Kept plural/collection-oriented.
+_TOTAL_NOUN = (
+    r"(?:propert(?:y|ies)|vacation\s+rentals?|holiday\s+(?:homes?|lets?|rentals?)"
+    r"|rental\s+homes?|rentals?|listings?|results?|villas?|cabins?|condos?"
+    r"|accommodations?|homes?|properties\s+found)"
+)
+
+# Patterns tagged (regex, safe). "Safe" patterns anchor the number inside a
+# "… of N …" / "N … found" phrasing where a stray year/date can't slip in.
+# The one "loose" pattern ("N <noun>") is prone to matching copyright years
+# ("© 2023 … Rentals"), so year-range numbers are rejected from it.
+_STATED_PATTERNS = [
+    # "Showing 1–20 of 442", "1-12 of 84 results"
+    (re.compile(r"(?i)\b\d[\d,]*\s*[-–—]\s*\d[\d,]*\s+of\s+([\d,]{2,})"), True),
+    # "of 442 properties", "of 84 results"
+    (re.compile(r"(?i)\bof\s+([\d,]{2,})\s+" + _TOTAL_NOUN), True),
+    # "442 properties found", "84 results found"
+    (re.compile(r"(?i)\b([\d,]{2,})\s+(?:propert(?:y|ies)|results?|homes?|rentals?)\s+found"), True),
+    # "442 properties", "84+ vacation rentals", "1,024 listings"  (loose)
+    (re.compile(r"(?i)\b([\d,]{2,})\s*\+?\s+" + _TOTAL_NOUN), False),
+]
+
+_MIN_STATED = 10
+_MAX_STATED = 200000
+
+
+def _looks_like_year(n: int) -> bool:
+    return 1990 <= n <= 2099
+
+
+def extract_stated_total(content: str) -> Optional[int]:
+    """Return the largest plausible site-stated property/result total, or None.
+
+    Accepts numbers >= 10 attached to a listing noun, so per-card values like
+    "3 bedrooms" / "8 guests" / "$450 / night" are ignored. Year-range numbers
+    (copyright/dates) are rejected from the loose "N <noun>" pattern.
+    """
+    if not content:
+        return None
+    best: Optional[int] = None
+    for pat, safe in _STATED_PATTERNS:
+        for m in pat.finditer(content):
+            try:
+                n = int(m.group(1).replace(",", ""))
+            except (ValueError, IndexError):
+                continue
+            if not (_MIN_STATED <= n <= _MAX_STATED):
+                continue
+            if not safe and _looks_like_year(n):
+                continue
+            if best is None or n > best:
+                best = n
+    return best
 
 
 # Pagination links so paginated listings can be fully crawled and summed.
