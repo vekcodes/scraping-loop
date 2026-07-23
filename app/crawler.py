@@ -258,24 +258,26 @@ def _build_response(
 
     max_pagination = max(pagination_totals) if pagination_totals else None
 
-    # A single "stated" signal combining the deterministic regex (any page) and
-    # the LLM's stated_total reads. This is the site's own printed count.
-    stated_candidates = list(stated_totals_seen) + list(stated_totals)
-    stated_all = max(stated_candidates) if stated_candidates else None
+    # Trusted result-set total from the deterministic regex (any page). This is
+    # the ONLY signal allowed to raise the count above what we actually counted,
+    # because it's the only one that's both explicit and hard to fake.
+    safe_stated = max(stated_totals_seen) if stated_totals_seen else None
+    # LLM's own stated read — unreliable (it sometimes returns phone/marketing
+    # numbers), so used only as a last resort when nothing could be counted.
+    llm_stated = max(stated_totals) if stated_totals else None
 
     # ── Reconcile into one total + basis ────────────────────────────────────
-    # The deterministic detail-key union is primary: across categories it sums
-    # distinct properties, across pagination it dedupes overlap. But when the
-    # site PRINTS a larger total than we could find links for (JS/lazy-load/
-    # pagination only ships a partial grid), trust that printed number.
+    # Deterministic detail-key union is primary (sums categories, dedupes
+    # pagination). A trusted "… of N …" result-set total overrides it upward
+    # when the page only shipped a partial grid (JS/lazy-load).
     if det_total > 0:
         total, basis = det_total, "counted_items"
-        if max_pagination is not None and max_pagination > total:
-            total, basis = max_pagination, "pagination"
-        if stated_all is not None and stated_all > total:
-            total, basis = stated_all, "stated_total"
-    elif stated_all is not None:
-        total, basis = stated_all, "stated_total"
+        if safe_stated is not None and safe_stated > total:
+            total, basis = safe_stated, "stated_total"
+    elif safe_stated is not None:
+        total, basis = safe_stated, "stated_total"
+    elif llm_stated is not None:
+        total, basis = llm_stated, "stated_total"
     elif max_pagination is not None:
         total, basis = max_pagination, "pagination"
     elif llm_counted_sum > 0:

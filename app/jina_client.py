@@ -329,50 +329,40 @@ _TOTAL_NOUN = (
     r"|accommodations?|homes?|properties\s+found)"
 )
 
-# Patterns tagged (regex, safe). "Safe" patterns anchor the number inside a
-# "… of N …" / "N … found" phrasing where a stray year/date can't slip in.
-# The one "loose" pattern ("N <noun>") is prone to matching copyright years
-# ("© 2023 … Rentals"), so year-range numbers are rejected from it.
+# Only "result-set total" phrasings are trusted — the number is bound inside a
+# "… of N …" / "N … found" construction that genuinely denotes how many items a
+# listing holds. The looser "N properties" phrasing is deliberately NOT used: on
+# directories/aggregators it matches per-region/marketing counts ("293 rentals",
+# "3,886 rentals with Private Pool") and produces wild overcounts.
 _STATED_PATTERNS = [
     # "Showing 1–20 of 442", "1-12 of 84 results"
-    (re.compile(r"(?i)\b\d[\d,]*\s*[-–—]\s*\d[\d,]*\s+of\s+([\d,]{2,})"), True),
+    re.compile(r"(?i)\b\d[\d,]*\s*[-–—]\s*\d[\d,]*\s+of\s+([\d,]{2,})"),
     # "of 442 properties", "of 84 results"
-    (re.compile(r"(?i)\bof\s+([\d,]{2,})\s+" + _TOTAL_NOUN), True),
+    re.compile(r"(?i)\bof\s+([\d,]{2,})\s+" + _TOTAL_NOUN),
     # "442 properties found", "84 results found"
-    (re.compile(r"(?i)\b([\d,]{2,})\s+(?:propert(?:y|ies)|results?|homes?|rentals?)\s+found"), True),
-    # "442 properties", "84+ vacation rentals", "1,024 listings"  (loose)
-    (re.compile(r"(?i)\b([\d,]{2,})\s*\+?\s+" + _TOTAL_NOUN), False),
+    re.compile(r"(?i)\b([\d,]{2,})\s+(?:propert(?:y|ies)|results?|homes?|rentals?)\s+found"),
 ]
 
 _MIN_STATED = 10
 _MAX_STATED = 200000
 
 
-def _looks_like_year(n: int) -> bool:
-    return 1990 <= n <= 2099
-
-
 def extract_stated_total(content: str) -> Optional[int]:
-    """Return the largest plausible site-stated property/result total, or None.
+    """Return the largest trusted result-set total ("… of 442 …"), or None.
 
-    Accepts numbers >= 10 attached to a listing noun, so per-card values like
-    "3 bedrooms" / "8 guests" / "$450 / night" are ignored. Year-range numbers
-    (copyright/dates) are rejected from the loose "N <noun>" pattern.
+    Only result-set phrasings count, so per-card values ("3 bedrooms"), prices
+    ("$450/night"), and directory/marketing counts ("293 rentals") are ignored.
     """
     if not content:
         return None
     best: Optional[int] = None
-    for pat, safe in _STATED_PATTERNS:
+    for pat in _STATED_PATTERNS:
         for m in pat.finditer(content):
             try:
                 n = int(m.group(1).replace(",", ""))
             except (ValueError, IndexError):
                 continue
-            if not (_MIN_STATED <= n <= _MAX_STATED):
-                continue
-            if not safe and _looks_like_year(n):
-                continue
-            if best is None or n > best:
+            if _MIN_STATED <= n <= _MAX_STATED and (best is None or n > best):
                 best = n
     return best
 
