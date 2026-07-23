@@ -7,7 +7,7 @@ serverless function automatically.
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
-from app.crawler import check_properties
+from app.crawler import ClassificationError, check_properties
 from app.schemas import CheckRequest, CheckResponse
 
 load_dotenv()
@@ -32,5 +32,8 @@ async def check_properties_endpoint(req: CheckRequest) -> CheckResponse:
         raise HTTPException(status_code=400, detail="url is required")
     try:
         return await check_properties(url)
+    except ClassificationError as exc:
+        # Almost always a bad/missing OpenAI key or exhausted quota.
+        raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:  # pragma: no cover - defensive top-level guard
         raise HTTPException(status_code=502, detail=f"check failed: {exc}")

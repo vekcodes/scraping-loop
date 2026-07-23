@@ -5,8 +5,9 @@ clean markdown, so this service only ever makes plain HTTP calls.
 """
 
 import os
-from typing import Optional
-from urllib.parse import urlparse
+import re
+from typing import List, Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -62,3 +63,76 @@ def normalize_url(url: str) -> str:
         url = "https://" + url
     # Drop fragments — they don't change the fetched page.
     return url.split("#", 1)[0]
+
+
+def registered_domain(host: str) -> str:
+    """Return the last two labels of a host (e.g. 'revavista.com').
+
+    Good enough to treat 'rentals.revavista.com' and 'www.revavista.com' as the
+    same site while rejecting truly external domains.
+    """
+    host = (host or "").lower().split(":")[0]
+    parts = [p for p in host.split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def same_site(url_a: str, url_b: str) -> bool:
+    return registered_domain(urlparse(url_a).netloc) == registered_domain(
+        urlparse(url_b).netloc
+    )
+
+
+# Keywords that flag a link as a likely listings/portfolio page. Matched against
+# both the link's URL and its anchor text.
+CANDIDATE_KEYWORDS = (
+    "propert",      # property, properties
+    "listing",
+    "rental",
+    "portfolio",
+    "our-homes",
+    "our homes",
+    "homes",
+    "vacation-rental",
+    "accommodation",
+    "villa",
+    "cabin",
+    "condo",
+    "where-we-manage",
+    "where we manage",
+    "search",
+    "book",
+    "stays",
+)
+
+# Markdown link: [anchor text](url)
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+
+
+def extract_candidate_links(base_url: str, content: str) -> List[str]:
+    """Scan a page's markdown for links that likely lead to property listings.
+
+    Returns absolute, same-site, deduped URLs whose URL or anchor text matches
+    a candidate keyword. This is the 'link scanner' from the build plan: it lets
+    the crawler find the listings page even when the current page (e.g. a
+    marketing homepage) is itself classified 'irrelevant'.
+    """
+    if not content:
+        return []
+
+    seen: set = set()
+    out: List[str] = []
+    for anchor, raw_link in _MD_LINK_RE.findall(content):
+        link = normalize_url(urljoin(base_url, raw_link))
+        if not link or link in seen:
+            continue
+        haystack = (raw_link + " " + anchor).lower()
+        if not any(kw in haystack for kw in CANDIDATE_KEYWORDS):
+            continue
+        if not same_site(base_url, link):
+            continue
+        # Skip obvious asset/image links.
+        if re.search(r"\.(png|jpe?g|svg|gif|webp|pdf|css|js)(\?|$)", link, re.I):
+            continue
+        seen.add(link)
+        out.append(link)
+    return out
