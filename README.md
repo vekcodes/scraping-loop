@@ -6,9 +6,28 @@ confident that count is — distinguishing individual property listings from
 category/collection groupings.
 
 It scrapes pages via [r.jina.ai](https://r.jina.ai) (which renders JS on its
-own infrastructure and returns clean markdown) and classifies each page with
-OpenAI `gpt-4o-mini`. No headless browser runs in this code, so it fits
-Vercel's serverless model.
+own infrastructure and returns clean markdown) and uses OpenAI to classify
+pages and find where the listings live. No headless browser runs in this code,
+so it fits Vercel's serverless model.
+
+## How the count is derived
+
+Counting does **not** rely on the LLM eyeballing a page (it double-counts
+grid/list renders and miscounts image links). Instead the count is
+**deterministic**: every property links to its own detail page, so the service
+extracts each unique detail-page link and counts the distinct ones. This is
+stable across the common site permutations:
+
+- path slugs — `/stowaway`, `/white-house-cottage`
+- query-id links — `/details.aspx?PropertyID=391025`
+- nested detail paths — `/rentals/beach-villa`
+- properties shown as cards with a name + photo linking to a detail page
+
+Across category pages the distinct links are **unioned** (so a site split into
+"Beachfront / Downtown" sums correctly), and across pagination they are
+**deduped**. The LLM still reads any explicitly stated total ("47 properties")
+or pagination total ("Showing 12 of 84") and those refine the deterministic
+count when the site advertises more than could be scraped.
 
 ## API
 
@@ -26,16 +45,24 @@ Response:
 ```json
 {
   "has_10_plus_properties": true,
-  "property_count": 47,
+  "property_count": 52,
   "count_type": "confirmed",
-  "source": "summed across 3 listing pages",
-  "pages_checked": ["https://.../", "https://.../properties"]
+  "source": "count from https://.../properties (basis: counted_items)",
+  "pages_checked": ["https://.../", "https://.../properties"],
+  "breakdown": [
+    { "url": "https://.../properties", "count": 52, "count_basis": "counted_items" }
+  ]
 }
 ```
 
-`count_type` is `"confirmed"` when every listing page produced a count and no
-fetch failed; otherwise `"estimated"`. If no signal is found anywhere,
-`property_count` is `null` and `source` is `"no property count signal found"`.
+- `count_type` — `"confirmed"` when the number is either explicitly stated by
+  the site or came from a complete deterministic card count (no fetch failures,
+  not undercut by pagination); otherwise `"estimated"`.
+- `breakdown` — per-listing-page contribution, so the total is auditable.
+- `count_basis` — how a number was derived: `stated_total`, `pagination`,
+  `counted_items` (distinct detail links / cards), or `unknown`.
+- If no signal is found anywhere, `property_count` is `null` and `source` is
+  `"no property count signal found"`.
 
 ## Local development
 
@@ -65,6 +92,8 @@ Interactive docs at http://localhost:8000/docs.
 | `MAX_PAGES_PER_SITE` | Caps total pages fetched per request | 8 |
 | `MAX_CRAWL_DEPTH` | Caps how deep into categories it drills | 2 |
 | `JINA_TIMEOUT_SECONDS` | Per-page fetch timeout | 15 |
+| `CLASSIFIER_MODEL` | LLM used to classify pages; upgrade (e.g. `gpt-4o`) for tricky sites | gpt-4o-mini |
+| `MAX_CONTENT_CHARS` | Page markdown sent to the model; larger avoids truncated undercounts | 48000 |
 
 ## Deploy to Vercel
 
