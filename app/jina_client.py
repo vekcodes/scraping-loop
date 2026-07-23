@@ -22,11 +22,33 @@ def _jina_timeout() -> float:
 
 
 def _headers() -> dict:
-    headers = {"Accept": "text/plain"}
+    headers = {
+        "Accept": "text/plain",
+        # Append a "Links/Buttons" summary of every anchor on the page. Nav menus
+        # (often JS-rendered) are otherwise dropped from the markdown, so a
+        # homepage may not expose its "/properties" link without this.
+        "X-With-Links-Summary": "true",
+    }
     api_key = os.getenv("JINA_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+# Markers that begin Jina's appended link/image summary section.
+_SUMMARY_MARKERS = ("Links/Buttons", "\n## Links", "\nLinks:", "\nImages:")
+
+
+def strip_links_summary(content: str) -> str:
+    """Return only the page's main content, dropping Jina's link/image summary.
+
+    Counting property cards must use the main content — the appended link
+    summary lists nav/utility pages that would otherwise inflate the count.
+    """
+    if not content:
+        return content
+    idxs = [i for i in (content.find(m) for m in _SUMMARY_MARKERS) if i > 0]
+    return content[: min(idxs)] if idxs else content
 
 
 async def fetch_via_jina(client: httpx.AsyncClient, target_url: str) -> Optional[str]:

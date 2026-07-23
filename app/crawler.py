@@ -22,6 +22,7 @@ from .jina_client import (
     extract_pagination_links,
     fetch_via_jina,
     normalize_url,
+    strip_links_summary,
 )
 from .schemas import CheckResponse, PageClassification, PageCount
 
@@ -74,12 +75,15 @@ class PageResult:
 
 
 async def _process_page(client: httpx.AsyncClient, page_url: str) -> PageResult:
-    """Fetch + classify one page, capturing fetch/classify failures separately."""
+    """Fetch + classify one page, capturing fetch/classify failures separately.
+
+    Classification uses the main content only (not Jina's appended link summary).
+    """
     content = await fetch_via_jina(client, page_url)
     if not content:
         return PageResult(page_url, None, None, fetch_failed=True, classify_failed=False)
     try:
-        classification = await classify_page(page_url, content)
+        classification = await classify_page(page_url, strip_links_summary(content))
     except Exception as exc:  # API error (auth, rate limit, timeout, etc.)
         logger.warning("Classification failed for %s: %s", page_url, exc)
         return PageResult(page_url, None, content, fetch_failed=False, classify_failed=True)
@@ -129,7 +133,8 @@ async def check_properties(url: str) -> CheckResponse:
 
                 classify_successes += 1
                 classification = res.classification
-                content = res.content or ""
+                full = res.content or ""            # includes Jina link summary
+                main = strip_links_summary(full)     # page body only
 
                 if classification.type == "individual_listings":
                     listing_pages.append(
@@ -137,20 +142,22 @@ async def check_properties(url: str) -> CheckResponse:
                             url=res.url,
                             llm_count=classification.count_if_any,
                             llm_basis=classification.count_basis,
-                            detail_keys=extract_detail_keys(res.url, content, res.url),
-                            heading_count=count_headings(content),
+                            # Count cards from the body only, never the link dump.
+                            detail_keys=extract_detail_keys(res.url, main, res.url),
+                            heading_count=count_headings(main),
                         )
                     )
-                    # A listings page may be paginated — follow "next page" links
-                    # so every property is captured (global dedup handles overlap).
-                    for link in extract_pagination_links(res.url, content):
+                    # A listings page may be paginated — follow "next page" links.
+                    for link in extract_pagination_links(res.url, full):
                         if link not in visited:
                             next_queue.append(link)
-                    continue
 
-                # For homepage (irrelevant) and category pages alike, discover
-                # where the listings actually live via the keyword link scanner.
-                for link in extract_candidate_links(res.url, content):
+                # Always look for links to (other) listings pages — the entry URL
+                # may be a homepage that only shows a few featured properties while
+                # the full list lives at /properties. Global detail-key dedup makes
+                # exploring extra pages safe (no double counting). Discovery uses
+                # the FULL content so nav links in Jina's summary are included.
+                for link in extract_candidate_links(res.url, full):
                     if link not in visited:
                         next_queue.append(link)
 
